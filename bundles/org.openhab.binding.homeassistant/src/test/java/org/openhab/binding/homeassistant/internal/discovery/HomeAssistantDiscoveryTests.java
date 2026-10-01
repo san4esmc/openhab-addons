@@ -14,8 +14,12 @@ package org.openhab.binding.homeassistant.internal.discovery;
 
 import static org.hamcrest.CoreMatchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -23,7 +27,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
@@ -53,6 +60,7 @@ import org.openhab.core.thing.ThingUID;
 public class HomeAssistantDiscoveryTests extends AbstractHomeAssistantTests {
     private @NonNullByDefault({}) HomeAssistantDiscovery discovery;
     private static final int DISCOVERY_TIMEOUT_SECONDS = 5;
+    private static final int PUBLICATION_SAFETY_TIMEOUT_SECONDS = 30;
 
     @BeforeEach
     public void beforeEach() {
@@ -113,7 +121,7 @@ public class HomeAssistantDiscoveryTests extends AbstractHomeAssistantTests {
         assertThat(result.getProperties().get(HandlerConfiguration.PROPERTY_BASETOPIC), is("homeassistant"));
         assertThat(result.getLabel(), is("th1"));
         assertThat((List<String>) result.getProperties().get(HandlerConfiguration.PROPERTY_TOPICS),
-                hasItems("climate/0x847127fffe11dd6a_climate_zigbee2mqtt"));
+                contains("climate/0x847127fffe11dd6a_climate_zigbee2mqtt"));
 
         // Now another component added to the same thing
         latch = discoveryListener.createWaitForThingsDiscoveredLatch(1);
@@ -182,13 +190,158 @@ public class HomeAssistantDiscoveryTests extends AbstractHomeAssistantTests {
         assertThat(result.getProperties().get(HandlerConfiguration.PROPERTY_BASETOPIC), is("homeassistant"));
         assertThat(result.getLabel(), is("th1"));
         assertThat((List<String>) result.getProperties().get(HandlerConfiguration.PROPERTY_TOPICS),
-                hasItems("climate/0x847127fffe11dd6a_climate_zigbee2mqtt"));
+                contains("climate/0x847127fffe11dd6a_climate_zigbee2mqtt"));
+    }
+
+    @Test
+    public void testRemovedThingIsNotRepublished() throws Exception {
+        var blockingDiscovery = new BlockingHomeAssistantDiscovery(channelTypeProvider, PYTHON);
+        discovery = blockingDiscovery;
+        String topic = "homeassistant/climate/0x847127fffe11dd6a_climate_zigbee2mqtt/config";
+        discovery.receivedMessage(HA_UID, bridgeConnection, topic,
+                getResourceAsByteArray("component/configTS0601ClimateThermostat.json"));
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            AtomicReference<Thread> publishingThread = new AtomicReference<>();
+            var publication = executor.submit(() -> {
+                publishingThread.set(Thread.currentThread());
+                discovery.publishResults();
+            });
+            assertTrue(blockingDiscovery.publicationStarted.await(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+            CountDownLatch removalStarted = new CountDownLatch(1);
+            AtomicReference<Thread> removingThread = new AtomicReference<>();
+            var removal = executor.submit(() -> {
+                removingThread.set(Thread.currentThread());
+                removalStarted.countDown();
+                discovery.topicVanished(HA_UID, bridgeConnection, topic);
+            });
+            try {
+                assertTrue(removalStarted.await(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(DISCOVERY_TIMEOUT_SECONDS);
+                while (!removal.isDone() && !isBlockedBy(removingThread.get(), publishingThread.get())
+                        && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertTrue(isBlockedBy(removingThread.get(), publishingThread.get()),
+                        "Removal did not wait for the in-flight publication");
+            } finally {
+                blockingDiscovery.continuePublication.countDown();
+            }
+            publication.get(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            removal.get(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        assertThat(blockingDiscovery.notificationOrder, contains("discovered", "removed"));
+        var discoveryListener = new LatchDiscoveryListener();
+        discovery.addDiscoveryListener(discoveryListener);
+        assertTrue(discoveryListener.getDiscoveryResults().isEmpty());
+    }
+
+    private static boolean isBlockedBy(Thread blockedThread, Thread lockOwner) {
+        ThreadInfo threadInfo = ManagementFactory.getThreadMXBean().getThreadInfo(blockedThread.threadId());
+        return threadInfo != null && threadInfo.getThreadState() == Thread.State.BLOCKED
+                && threadInfo.getLockOwnerId() == lockOwner.threadId();
+    }
+
+    @Test
+    public void testDeviceDiscoveryAddsFullPayloadToDeviceConfigProperty() throws Exception {
+        var discoveryListener = new LatchDiscoveryListener();
+        var latch = discoveryListener.createWaitForThingsDiscoveredLatch(1);
+
+        discovery.addDiscoveryListener(discoveryListener);
+        byte[] payload = getResourceAsByteArray("component/configDevice1.json");
+        discovery.receivedMessage(HA_UID, bridgeConnection, "homeassistant/device/mydevice/config", payload);
+
+        assertTrue(latch.await(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        var discoveryResults = discoveryListener.getDiscoveryResults();
+        assertThat(discoveryResults.size(), is(1));
+
+        DiscoveryResult result = discoveryResults.getFirst();
+        assertThat(result.getProperties().get(HandlerConfiguration.PROPERTY_DEVICE_CONFIG),
+                is(new String(payload, StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    public void testDeviceDiscoveryWithoutComponentsStillCreatesThing() throws Exception {
+        var discoveryListener = new LatchDiscoveryListener();
+        var latch = discoveryListener.createWaitForThingsDiscoveredLatch(1);
+        String payload = """
+                {
+                  "dev": {
+                    "ids": ["ea334450945afc"],
+                    "name": "Kitchen",
+                    "mf": "Bla electronics",
+                    "mdl": "xya",
+                    "sw": "1.0",
+                    "sn": "ea334450945afc",
+                    "hw": "1.0rev2"
+                  },
+                  "o": {
+                    "name":"bla2mqtt",
+                    "sw": "2.1",
+                    "url": "https://bla2mqtt.example.com/support"
+                  },
+                  "cmps": {},
+                  "state_topic":"sensorBedroom/state",
+                  "qos": 2
+                }
+                """;
+
+        discovery.addDiscoveryListener(discoveryListener);
+        discovery.receivedMessage(HA_UID, bridgeConnection, "homeassistant/device/mydevice/config",
+                payload.getBytes(StandardCharsets.UTF_8));
+
+        assertTrue(latch.await(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        var discoveryResults = discoveryListener.getDiscoveryResults();
+        assertThat(discoveryResults.size(), is(1));
+
+        DiscoveryResult result = discoveryResults.getFirst();
+        assertThat(result.getBridgeUID(), is(HA_UID));
+        assertThat(result.getLabel(), is("Kitchen"));
+        assertThat(result.getProperties().get(Thing.PROPERTY_VENDOR), is("Bla electronics"));
+        assertThat(result.getProperties().get(Thing.PROPERTY_MODEL_ID), is("xya"));
+        assertThat(result.getProperties().get(Thing.PROPERTY_FIRMWARE_VERSION), is("1.0"));
+        assertThat((List<String>) result.getProperties().get(HandlerConfiguration.PROPERTY_TOPICS),
+                hasItems("device/mydevice"));
+        assertThat(result.getProperties().get(HandlerConfiguration.PROPERTY_DEVICE_CONFIG), is(payload));
     }
 
     private static class TestHomeAssistantDiscovery extends HomeAssistantDiscovery {
         public TestHomeAssistantDiscovery(MqttChannelTypeProvider typeProvider, HomeAssistantPythonBridge python) {
             super(null, python);
             this.typeProvider = typeProvider;
+        }
+    }
+
+    private static class BlockingHomeAssistantDiscovery extends TestHomeAssistantDiscovery {
+        private final CountDownLatch publicationStarted = new CountDownLatch(1);
+        private final CountDownLatch continuePublication = new CountDownLatch(1);
+        private final CopyOnWriteArrayList<String> notificationOrder = new CopyOnWriteArrayList<>();
+
+        public BlockingHomeAssistantDiscovery(MqttChannelTypeProvider typeProvider, HomeAssistantPythonBridge python) {
+            super(typeProvider, python);
+        }
+
+        @Override
+        protected void thingDiscovered(DiscoveryResult result) {
+            publicationStarted.countDown();
+            try {
+                if (!continuePublication.await(PUBLICATION_SAFETY_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    throw new AssertionError("Publication was not released");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+            super.thingDiscovered(result);
+            notificationOrder.add("discovered");
+        }
+
+        @Override
+        protected void thingRemoved(ThingUID thingUID) {
+            super.thingRemoved(thingUID);
+            notificationOrder.add("removed");
         }
     }
 

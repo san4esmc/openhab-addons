@@ -44,7 +44,7 @@ public class ForecastDiscoveryMapper implements EvccDiscoveryMapper {
     public Collection<DiscoveryResult> discover(JsonObject state, EvccBridgeHandler bridgeHandler) {
         List<DiscoveryResult> results = new ArrayList<>();
         JsonObject forecasts = state.getAsJsonObject(JSON_KEY_FORECAST);
-        if (forecasts == null) {
+        if (forecasts == null || forecasts.isEmpty()) {
             return results;
         }
         for (Map.Entry<String, JsonElement> entry : forecasts.entrySet()) {
@@ -55,7 +55,7 @@ public class ForecastDiscoveryMapper implements EvccDiscoveryMapper {
             ThingUID uid = new ThingUID(THING_TYPE_FORECAST, bridgeHandler.getThing().getUID(),
                     Utils.sanitizeName(forecastType));
             String label = "Forecast " + capitalizeFirstLetter(forecastType);
-            String id = Utils.createIdString(List.of(label));
+            String id = Utils.createIdString(label);
             DiscoveryResult result = DiscoveryResultBuilder.create(uid).withLabel(label)
                     .withBridge(bridgeHandler.getThing().getUID()).withProperty(PROPERTY_TYPE, PROPERTY_FORECAST)
                     .withProperty(PROPERTY_SUBTYPE, forecastType).withProperty(PROPERTY_ID, id)

@@ -26,15 +26,13 @@ public class BluelinkBindingConstants {
 
     public static final String BINDING_ID = "bluelink";
 
+    // the CCI token exchange sends several JWTs as headers, more than the default 4 kB request buffer holds
+    public static final int HTTP_REQUEST_BUFFER_SIZE = 32 * 1024;
+
     // Thing Type UIDs
     public static final ThingTypeUID THING_TYPE_ACCOUNT = new ThingTypeUID(BINDING_ID, "account");
     public static final ThingTypeUID THING_TYPE_VEHICLE = new ThingTypeUID(BINDING_ID, "vehicle");
     public static final Set<ThingTypeUID> SUPPORTED_THING_TYPES_UIDS = Set.of(THING_TYPE_ACCOUNT, THING_TYPE_VEHICLE);
-
-    // API Configuration
-    public static final String API_ENDPOINT = "https://api.telematics.hyundaiusa.com";
-    public static final String CLIENT_ID = "m66129Bb-em93-SPAHYN-bZ91-am4540zp19920";
-    public static final String CLIENT_SECRET = "v558o935-6nne-423i-baa8";
 
     // Channel Groups
     public static final String GROUP_STATUS = "status";
